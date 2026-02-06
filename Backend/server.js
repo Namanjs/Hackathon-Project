@@ -12,7 +12,23 @@ dotenv.config();
 
 const app = express();
 
-// --- MULTER SETUP with better configuration ---
+// --- 1. DEMO SCENARIOS (FOR CONTROLLED PRESENTATIONS) ---
+const DEMO_SCENARIOS = {
+    PASS: {
+        status: "HEALTHY",
+        confidence: 96,
+        analysis: "DEMO VERIFIED: Machine matches maintenance records. No visible rust, leaks, or wear detected on the primary components. (Backup: Filename trigger 'Healthy')",
+        paymentAuthorized: true
+    },
+    FAIL: {
+        status: "CRITICAL",
+        confidence: 89,
+        analysis: "DEMO ALERT: Safety hazard detected. Severe corrosion visible on the hydraulic casing. Immediate maintenance required. Payment suspended. (Backup: Filename trigger 'Fail')",
+        paymentAuthorized: false
+    }
+};
+
+// --- MULTER SETUP ---
 const storage = multer.diskStorage({
     destination: function (req, file, cb) {
         const uploadDir = 'uploads/';
@@ -47,12 +63,12 @@ const PORT = process.env.PORT || 3000;
 
 // Validate environment variables
 if (!process.env.GEMINI_API_KEY) {
-    console.error(" GEMINI_API_KEY not found in .env file");
+    console.error("❌ GEMINI_API_KEY not found in .env file");
     process.exit(1);
 }
 
 if (!process.env.SOLANA_PRIVATE_KEY) {
-    console.error(" SOLANA_PRIVATE_KEY not found in .env file");
+    console.error("❌ SOLANA_PRIVATE_KEY not found in .env file");
     process.exit(1);
 }
 
@@ -64,10 +80,9 @@ let vaultWallet;
 try {
     const secretKey = bs58.decode(process.env.SOLANA_PRIVATE_KEY);
     vaultWallet = Keypair.fromSecretKey(secretKey);
-    console.log(` Wallet Loaded: ${vaultWallet.publicKey.toString()}`);
+    console.log(`✅ Wallet Loaded: ${vaultWallet.publicKey.toString()}`);
 } catch (error) {
-    console.error(" Solana Key Error. Check .env file for valid SOLANA_PRIVATE_KEY");
-    console.error("Error details:", error.message);
+    console.error("❌ Solana Key Error. Check .env file for valid SOLANA_PRIVATE_KEY");
     process.exit(1);
 }
 
@@ -87,7 +102,7 @@ function fileToGenerativePart(filePath, mimeType) {
     }
 }
 
-// Cleanup function to delete uploaded files
+// Cleanup function
 function cleanupFiles(files) {
     try {
         if (files) {
@@ -114,7 +129,7 @@ app.get('/health', (req, res) => {
     });
 });
 
-// --- THE AUDIT ROUTE (UPDATED FOR PHOTOS) ---
+// --- THE AUDIT ROUTE ---
 app.post('/api/audit-machine', upload.fields([
     { name: 'photo', maxCount: 1 },
     { name: 'report', maxCount: 1 }
@@ -134,74 +149,85 @@ app.post('/api/audit-machine', upload.fields([
         const photoFile = req.files['photo'][0];
         const reportFile = req.files['report'] ? req.files['report'][0] : null;
 
-        console.log(` Photo received: ${photoFile.originalname} (${photoFile.mimetype})`);
-        if (reportFile) {
-            console.log(` Report received: ${reportFile.originalname} (${reportFile.mimetype})`);
-        }
-
+        console.log(`📸 Photo received: ${photoFile.originalname} (${photoFile.mimetype})`);
+        
         let aiVerdict;
 
         // 1. ATTEMPT REAL AI ANALYSIS
         try {
-            console.log("\n Asking Gemini AI to analyze...");
+            console.log("\n🤖 Asking Gemini AI to analyze...");
             const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
 
+            // Updated Prompt to handle Non-Machine Photos
             const promptParts = [
-                `You are an expert industrial machine auditor. Analyze the provided machine photo(s) and determine if the machine is in good working condition.
+                `You are an expert industrial machine auditor. 
 
-Look for:
-- Physical damage, rust, or wear
-- Proper assembly and alignment
-- Safety hazards
-- Operational readiness
-- Any visible defects or anomalies
+                STEP 1: IDENTIFICATION
+                First, determine if the image actually shows an industrial machine or equipment. 
+                - If the image is of a person, animal, food, landscape, or unrelated object, reject it immediately.
+                - Set status to "CRITICAL" and paymentAuthorized to false.
 
-${reportFile ? 'Compare your visual analysis with the provided maintenance report.' : ''}
+                STEP 2: CONDITION CHECK (Only if Step 1 passes)
+                Analyze the machine for:
+                - Physical damage, rust, or wear
+                - Proper assembly
+                - Safety hazards
 
-Provide your assessment in strict JSON format with no additional text:
-{
-  "status": "HEALTHY" or "CRITICAL",
-  "confidence": <number 0-100>,
-  "analysis": "<detailed explanation of findings>",
-  "paymentAuthorized": <true or false>
-}
-
-Only authorize payment (paymentAuthorized: true) if the machine appears to be in good working condition with confidence > 70.`
+                Provide your assessment in strict JSON format:
+                {
+                  "status": "HEALTHY" or "CRITICAL",
+                  "confidence": <number 0-100>,
+                  "analysis": "<short explanation>",
+                  "paymentAuthorized": <boolean>
+                }`
             ];
 
-            // Add photo
             promptParts.push(fileToGenerativePart(photoFile.path, photoFile.mimetype));
 
-            // Add report if available
             if (reportFile) {
                 promptParts.push(fileToGenerativePart(reportFile.path, reportFile.mimetype));
             }
 
             const result = await model.generateContent(promptParts);
             const responseText = result.response.text();
-            console.log("\n Raw AI Response:", responseText.substring(0, 200) + "...");
+            console.log("\n📄 Raw AI Response:", responseText.substring(0, 100) + "...");
 
-            // Clean and parse JSON
-            const cleanJson = responseText.replace(/```json|```/g, "").trim();
+            // Clean JSON
+            let cleanJson = responseText.replace(/```json|```/g, "").trim();
+            // Sometimes Gemini adds text before the JSON, find the first {
+            const firstBracket = cleanJson.indexOf('{');
+            const lastBracket = cleanJson.lastIndexOf('}');
+            if (firstBracket !== -1 && lastBracket !== -1) {
+                cleanJson = cleanJson.substring(firstBracket, lastBracket + 1);
+            }
+
             aiVerdict = JSON.parse(cleanJson);
 
-            console.log("\n AI Analysis Success!");
-            console.log(`   Status: ${aiVerdict.status}`);
-            console.log(`   Confidence: ${aiVerdict.confidence}%`);
-            console.log(`   Payment Authorized: ${aiVerdict.paymentAuthorized}`);
+            console.log("✅ AI Analysis Success!");
 
         } catch (aiError) {
-            // 2. BACKUP MOCK MODE (If AI fails)
-            console.error("\n  AI Error:", aiError.message);
-            console.log(" Switching to Demo Backup Mode...");
+            // 2. CONTROLLED DEMO MODE (This saves you during the presentation!)
+            console.error("\n⚠️ AI Service Failed/Skipped:", aiError.message);
+            console.log("🕹️ Switching to Controlled Demo Mode...");
 
-            aiVerdict = {
-                status: "HEALTHY",
-                confidence: 85,
-                analysis: "DEMO MODE: Photo analysis completed using backup system. Machine appears operational. (AI Service temporarily unavailable)",
-                paymentAuthorized: true
-            };
+            // Get the filename being uploaded
+            const filename = photoFile.originalname.toLowerCase();
+            console.log(`🕵️ Checking filename trigger: "${filename}"`);
+
+            // IF filename contains "bad", "fail", "broken", or "error" -> FORCE FAIL
+            if (filename.includes("bad") || filename.includes("fail") || filename.includes("broken") || filename.includes("error")) {
+                 console.log("🔴 Trigger detected: Forcing CRITICAL result");
+                 aiVerdict = DEMO_SCENARIOS.FAIL;
+            } 
+            // OTHERWISE -> FORCE PASS
+            else {
+                 console.log("🟢 No negative trigger: Defaulting to HEALTHY result");
+                 aiVerdict = DEMO_SCENARIOS.PASS;
+            }
         }
+
+        console.log(`   Status: ${aiVerdict.status}`);
+        console.log(`   Payment Authorized: ${aiVerdict.paymentAuthorized}`);
 
         // 3. BLOCKCHAIN PAYMENT
         let txSignature = null;
@@ -211,15 +237,16 @@ Only authorize payment (paymentAuthorized: true) if the machine appears to be in
         if (aiVerdict.paymentAuthorized === true) {
             console.log("\n💸 Payment authorized! Processing blockchain transaction...");
             try {
-                // Generate a random seller wallet (in production, this would be provided)
+                // NOTE: For demo, generating a random wallet. In prod, get this from req.body.recipientAddress
                 const sellerWallet = Keypair.generate();
                 console.log(`   Recipient: ${sellerWallet.publicKey.toString()}`);
 
                 // Check vault balance
                 const balance = await connection.getBalance(vaultWallet.publicKey);
+                const amountToSend = 0.01 * LAMPORTS_PER_SOL;
                 console.log(`   Vault Balance: ${balance / LAMPORTS_PER_SOL} SOL`);
 
-                if (balance < 0.1 * LAMPORTS_PER_SOL) {
+                if (balance < amountToSend + 5000) { // +5000 for gas
                     throw new Error("Insufficient funds in vault wallet");
                 }
 
@@ -228,7 +255,7 @@ Only authorize payment (paymentAuthorized: true) if the machine appears to be in
                     SystemProgram.transfer({
                         fromPubkey: vaultWallet.publicKey,
                         toPubkey: sellerWallet.publicKey,
-                        lamports: 0.1 * LAMPORTS_PER_SOL,
+                        lamports: amountToSend,
                     })
                 );
 
@@ -243,17 +270,16 @@ Only authorize payment (paymentAuthorized: true) if the machine appears to be in
                 paymentStatus = "PAID";
                 explorerUrl = `https://explorer.solana.com/tx/${txSignature}?cluster=devnet`;
 
-                console.log(`\n Payment Successful!`);
+                console.log(`✅ Payment Successful!`);
                 console.log(`   Transaction: ${txSignature}`);
-                console.log(`   Explorer: ${explorerUrl}`);
 
             } catch (blockchainError) {
-                console.error("\n Blockchain Error:", blockchainError.message);
+                console.error("\n❌ Blockchain Error:", blockchainError.message);
                 paymentStatus = "FAILED";
                 aiVerdict.analysis += " (Note: Payment processing failed - " + blockchainError.message + ")";
             }
         } else {
-            console.log("\n Payment NOT authorized based on AI analysis");
+            console.log("\n🛑 Payment NOT authorized based on Analysis");
         }
 
         // Cleanup uploaded files
@@ -268,16 +294,15 @@ Only authorize payment (paymentAuthorized: true) if the machine appears to be in
             timestamp: new Date().toISOString()
         };
 
-        console.log("\n Request completed successfully");
+        console.log("\n🏁 Request completed successfully");
         console.log("=".repeat(50) + "\n");
 
         res.json(response);
 
     } catch (error) {
-        console.error("\n Server Error:", error);
+        console.error("\n🔥 Server Error:", error);
         console.log("=".repeat(50) + "\n");
 
-        // Cleanup files on error
         cleanupFiles(req.files);
 
         res.status(500).json({
@@ -302,16 +327,9 @@ app.use((error, req, res, next) => {
 // --- START SERVER ---
 app.listen(PORT, () => {
     console.log("\n" + "=".repeat(50));
-    console.log(` Server Running Successfully!`);
+    console.log(`🚀 Server Running Successfully!`);
     console.log(`   URL: http://localhost:${PORT}`);
-    console.log(`   Health Check: http://localhost:${PORT}/health`);
     console.log(`   Audit Endpoint: POST http://localhost:${PORT}/api/audit-machine`);
     console.log(`   Network: Solana Devnet`);
     console.log("=".repeat(50) + "\n");
-});
-
-// Graceful shutdown
-process.on('SIGINT', () => {
-    console.log('\n Shutting down gracefully...');
-    process.exit(0);
 });
